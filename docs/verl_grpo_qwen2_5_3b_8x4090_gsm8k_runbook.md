@@ -758,3 +758,226 @@ ImportError: Numba needs NumPy 2.2 or less. Got NumPy 2.4.
 
 就说明已经真正进入训练，不是在数据加载。
 
+## 11. 新增排障记忆：训练跑完后仍报 `DataLoader worker ... killed by signal: Killed`
+
+### 11.1 现象
+
+一次完整的 8 卡 GRPO 训练日志文件：
+
+- `/data/zyk_data/RL/logs/qwen2_5_3b_lora_8x4090_20260321_182216.ray.log`
+
+表面上看训练已经结束：
+
+- 进度到 `435/435`
+- 已打印最终 checkpoint 路径：
+  - `/data/zyk_data/RL/checkpoints/verl_grpo_gsm8k/qwen2_5_3b_lora_8x4090_20260321_182216/global_step_435`
+- 已打印 final validation metrics
+
+但日志最后仍然报错：
+
+- `Exception ignored in: <function _StatefulMultiProcessingDataLoaderIter.__del__ ...>`
+- `RuntimeError: DataLoader worker (pid 921998) is killed by signal: Killed.`
+
+### 11.2 非常关键的判断
+
+这个报错不代表训练主体失败。
+
+这次 case 里，真正的顺序是：
+
+1. 训练 step 已经全部完成
+2. 最终 validation 已完成
+3. `global_step_435` checkpoint 已经落盘
+4. 报错发生在 dataloader 销毁/进程回收阶段
+
+也就是说，这是“训练成功但退出不干净”，不是“训练中途炸了”。
+
+### 11.3 为什么会这样
+
+代码路径在：
+
+- `verl/verl/trainer/ppo/ray_trainer.py`
+- `torchdata.stateful_dataloader`
+
+原始行为是：
+
+1. `train_dataloader` 和 `val_dataloader` 使用 `StatefulDataLoader`
+2. 脚本没有显式传 `data.dataloader_num_workers`
+3. 默认配置来自：
+   - `/data/zyk_data/RL/verl/verl/trainer/config/data/legacy_data.yaml`
+   - 默认值是 `dataloader_num_workers: 8`
+4. trainer 正常 `return` 时没有显式关闭 dataloader
+5. worker 清理主要依赖 `torchdata` iterator 的 `__del__`
+
+因此退出时如果某个 dataloader worker 已经先被系统或父进程清掉，`__del__ -> _shutdown_workers() -> join()` 会把这个状态重新抛出来。
+
+### 11.4 根因判断
+
+这是一个“多进程 dataloader 收尾竞态 + 高内存压力”的问题。
+
+更具体地说：
+
+1. `StatefulDataLoader` 的 worker 清理依赖析构路径，不够稳。
+2. 这次训练末尾日志里的 CPU 内存使用已经接近：
+   - `perf/cpu_memory_used_gb ~= 195.5 GB`
+3. 在这种内存压力下，dataloader worker 被 `SIGKILL` 并不奇怪。
+
+因此，最合理的判断不是“GRPO 算法错了”，而是：
+
+- 训练主体完成
+- dataloader worker 在退出阶段被杀
+- `torchdata` 在析构 join 时把它报告成 `RuntimeError`
+
+### 11.5 解决思路
+
+分成两层：
+
+1. 修退出路径
+2. 降低这个 GSM8K 脚本对 dataloader 多进程的依赖
+
+第一层更本质：
+
+- 不要再完全依赖 `__del__` 清理 dataloader
+- trainer 正常结束时主动 shutdown dataloader iterator
+
+第二层更实用：
+
+- 这个 GSM8K 任务数据集小、训练主要耗时在 rollout 和 actor update
+- 默认 `num_workers=8` 的收益很小
+- 但会额外增加多进程退出复杂度和内存压力
+- 所以脚本默认改成 `DATALOADER_NUM_WORKERS=0`
+
+### 11.6 实际修改
+
+#### 1. trainer 显式关闭 dataloader
+
+修改文件：
+
+- `/data/zyk_data/RL/verl/verl/trainer/ppo/ray_trainer.py`
+
+新增方法：
+
+- `_shutdown_dataloader()`
+- `_shutdown_dataloaders()`
+
+关键作用：
+
+1. 读取 dataloader 的内部 `_iterator`
+2. 如果 iterator 有 `_shutdown_workers()`，在 trainer 正常结束时主动调用
+3. 把 dataloader 的 `_iterator` 置空，避免后续再走不受控析构路径
+
+调用时机：
+
+- `val_only` 返回前
+- 正常训练完成、打印 final validation metrics 后返回前
+
+#### 2. 训练脚本显式传 dataloader worker 数
+
+修改文件：
+
+- `/data/zyk_data/RL/run_qwen2_5_3b_gsm8k_grpo_8x4090.sh`
+
+新增行为：
+
+- 增加环境变量：
+  - `DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"`
+- 打印当前值
+- 启动训练时显式传：
+  - `data.dataloader_num_workers="${DATALOADER_NUM_WORKERS}"`
+
+### 11.7 为什么这里敢把默认值设成 0
+
+这是针对这个脚本的工程判断，不是通用结论。
+
+适用理由：
+
+1. 任务是 `GSM8K`
+2. 数据集不大
+3. 训练中真正耗时的是：
+   - rollout/generation
+   - old log prob
+   - ref log prob
+   - actor update
+4. 不在 dataloader
+5. 小数据集下 `8` 个 worker 的吞吐收益有限，但退出成本明显增加
+
+所以这里默认 `0` 是“稳定性优先”的合理折中。
+
+如果后续有人要改回更高并行度，建议：
+
+- 先试 `1`
+- 再试 `2`
+- 不要默认直接回到 `8`
+
+### 11.8 如何快速确认是不是同一个问题
+
+如果下次日志最后又报 dataloader 相关错误，不要先看最后一行，要按这个顺序判断：
+
+1. 先搜有没有最终 step：
+   - 例如 `step:435`
+2. 再搜有没有最终 checkpoint 路径：
+   - 例如 `local_global_step_folder: .../global_step_435`
+3. 再搜有没有 final validation metrics
+4. 如果上面三者都在，最后才出现：
+   - `Exception ignored in: ... __del__`
+   - `DataLoader worker ... killed by signal: Killed`
+   那基本就是同类问题：训练成功，退出不干净
+
+### 11.9 验证结果
+
+为了验证修复不是“看起来合理”，而是真的有效，跑了两次 smoke run。
+
+#### smoke run 1
+
+- 实验名：
+  - `qwen2_5_3b_smoke_20260322_123000`
+- 配置：
+  - `2 GPU`
+  - `train_max_samples=4`
+  - `val_max_samples=4`
+  - `total_epochs=1`
+  - 总步数 `1`
+- 结果：
+  - 正常训练
+  - 正常 validation
+  - 正常保存 `global_step_1`
+  - 退出码 `0`
+  - 日志中未出现：
+    - `Exception ignored`
+    - `DataLoader worker`
+    - `killed by signal`
+
+#### smoke run 2
+
+- 实验名：
+  - `qwen2_5_3b_smoke32x16_20260322_123500`
+- 配置：
+  - `2 GPU`
+  - `train_max_samples=32`
+  - `val_max_samples=16`
+  - `total_epochs=1`
+  - 总步数 `8`
+- 结果：
+  - 正常训练到 `8/8`
+  - 正常按 `save_freq=2` 保存 `global_step_2/4/6/8`
+  - 最终 `global_step_8` 落盘
+  - 退出码 `0`
+  - 同样未出现 dataloader cleanup 报错
+
+### 11.10 下次遇到同类问题时的推荐动作
+
+1. 先判断是否已经训练成功，不要看到最后一行报错就直接判 run 失败。
+2. 先看最终 checkpoint 是否存在。
+3. 如果是同类 dataloader cleanup 问题：
+   - 优先检查 trainer 是否还带着显式 dataloader shutdown 补丁
+   - 再检查当前脚本是否又把 `data.dataloader_num_workers` 调高了
+4. 对 GSM8K 这类小数据集：
+   - 默认保持 `DATALOADER_NUM_WORKERS=0`
+5. 如果必须提高 worker 数：
+   - 先从 `1` 或 `2` 开始压测
+   - 同时盯：
+     - `perf/cpu_memory_used_gb`
+     - 尾部是否出现 dataloader worker kill
+
+### 11.11 一句话总结
+
+`435/435` 跑完后出现 `DataLoader worker ... killed by signal: Killed`，优先把它当成“退出阶段的 dataloader 清理问题”，不是“GRPO 没跑完”；修复重点是“trainer 显式关闭 dataloader + 这个脚本默认不用多进程 dataloader”。
